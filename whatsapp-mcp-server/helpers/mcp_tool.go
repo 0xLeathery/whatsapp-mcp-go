@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -164,10 +166,10 @@ type searchContactsInput struct {
 }
 
 type listMessagesInput struct {
-	After             *string `mcp:"description:ISO-8601 formatted string"`
+	After             *string `json:"after,omitempty" jsonschema:"description:ISO-8601 formatted string"`
 	Before            *string `json:"before,omitempty" jsonschema:"description:ISO-8601 formatted string"`
 	SenderPhoneNumber *string `json:"sender_phone_number,omitempty"`
-	ChatJid           *string `json:"chat_jid,omitempty"`
+	ChatJid           *string `json:"chat_jid,omitempty" jsonschema:"description:Chat JID (e.g. 123@g.us) or the exact chat name"`
 	Query             *string `json:"query,omitempty" jsonschema:"description:Search term in message content"`
 	Limit             int     `json:"limit" jsonschema:"default:20"`
 	Page              int     `json:"page" jsonschema:"default:0"`
@@ -336,7 +338,7 @@ func searchContactsHandler(
 		return ErrResult("query is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/contacts/search?q="+in.Query, nil)
+	data, err := callAPI(http.MethodGet, "/contacts/search?q="+url.QueryEscape(in.Query), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -357,28 +359,29 @@ func listMessagesHandler(
 	req *mcp.CallToolRequest,
 	in listMessagesInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := ""
+	v := url.Values{}
 	if in.After != nil {
-		q += "&after=" + *in.After
+		v.Set("after", *in.After)
 	}
 	if in.Before != nil {
-		q += "&before=" + *in.Before
+		v.Set("before", *in.Before)
 	}
 	if in.SenderPhoneNumber != nil {
-		q += "&sender=" + *in.SenderPhoneNumber
+		v.Set("sender", *in.SenderPhoneNumber)
 	}
 	if in.ChatJid != nil {
-		q += "&chat=" + *in.ChatJid
+		v.Set("chat", *in.ChatJid)
 	}
 	if in.Query != nil {
-		q += "&search=" + *in.Query
+		v.Set("search", *in.Query)
 	}
-	q += fmt.Sprintf("&limit=%d&page=%d", in.Limit, in.Page)
+	v.Set("limit", strconv.Itoa(in.Limit))
+	v.Set("page", strconv.Itoa(in.Page))
 	if in.IncludeContext {
-		q += "&context=true"
+		v.Set("context", "true")
 	}
 
-	data, err := callAPI(http.MethodGet, "/messages?"+strings.TrimPrefix(q, "&"), nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+v.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -421,7 +424,7 @@ func getMessageContextHandler(
 	}
 
 	path := fmt.Sprintf("/messages/context/%s?before=%d&after=%d",
-		in.MessageID, in.Before, in.After)
+		url.PathEscape(in.MessageID), in.Before, in.After)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -441,15 +444,17 @@ func listChatsHandler(
 	req *mcp.CallToolRequest,
 	in listChatsInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := fmt.Sprintf("?limit=%d&page=%d", in.Limit, in.Page)
+	v := url.Values{}
+	v.Set("limit", strconv.Itoa(in.Limit))
+	v.Set("page", strconv.Itoa(in.Page))
 	if in.Query != nil && *in.Query != "" {
-		q += "&q=" + *in.Query
+		v.Set("q", *in.Query)
 	}
 	if in.SortBy != "" {
-		q += "&sort=" + in.SortBy
+		v.Set("sort", in.SortBy)
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats"+q, nil)
+	data, err := callAPI(http.MethodGet, "/chats?"+v.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -472,7 +477,7 @@ func getChatHandler(
 		return ErrResult("chat_jid is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats/"+in.ChatJid, nil)
+	data, err := callAPI(http.MethodGet, "/chats/"+url.PathEscape(in.ChatJid), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -495,7 +500,7 @@ func getDirectChatByContactHandler(
 	}
 
 	// GET /api/direct-contacts/{phone}/chat
-	path := fmt.Sprintf("/direct-contacts/%s/chat", in.SenderPhoneNumber)
+	path := fmt.Sprintf("/direct-contacts/%s/chat", url.PathEscape(in.SenderPhoneNumber))
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -542,7 +547,7 @@ func getContactChatsHandler(
 	}
 
 	// GET /api/contacts/{jid}/chats?limit=...&page=...
-	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", in.Jid, limit, page)
+	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", url.PathEscape(in.Jid), limit, page)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -557,7 +562,7 @@ func getContactChatsHandler(
 		return ErrResult("failed to parse chats response"), nil, nil
 	}
 
-	return &mcp.CallToolResult{}, result.Chats, nil
+	return OkResult(map[string]any{"chats": result.Chats, "count": result.Count}), nil, nil
 }
 
 func getLastInteractionHandler(
@@ -570,7 +575,7 @@ func getLastInteractionHandler(
 	}
 
 	// We simulate it by asking for 1 message from that sender
-	data, err := callAPI(http.MethodGet, "/messages?sender="+in.Jid+"&limit=1", nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+url.Values{"sender": {in.Jid}, "limit": {"1"}}.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}

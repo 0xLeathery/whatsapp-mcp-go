@@ -105,6 +105,10 @@ type Message struct {
 
 type MessageStore struct {
 	db *sql.DB
+	// contactsDB holds whatsmeow's own tables (whatsmeow_contacts etc.).
+	// With Postgres it is the same database as db; with SQLite whatsmeow
+	// keeps them in a separate file, store/whatsapp.db, opened read-only.
+	contactsDB *sql.DB
 }
 
 var isPostgres = false
@@ -184,6 +188,14 @@ func safeFilename(name string) string {
 	return name
 }
 
+// openContactsDB returns the database that holds whatsmeow's tables.
+func openContactsDB(db *sql.DB) (*sql.DB, error) {
+	if isPostgres {
+		return db, nil
+	}
+	return sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro&_busy_timeout=5000")
+}
+
 // NewMessageStore Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -234,11 +246,19 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	contactsDB, err := openContactsDB(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open contacts database: %v", err)
+	}
+
+	return &MessageStore{db: db, contactsDB: contactsDB}, nil
 }
 
 // Close the database connection
 func (store *MessageStore) Close() error {
+	if store.contactsDB != nil && store.contactsDB != store.db {
+		_ = store.contactsDB.Close()
+	}
 	return store.db.Close()
 }
 
@@ -2047,7 +2067,7 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	ts := msg.Timestamp.Format("2006-01-02 15:04:05")
 
 	if showChatInfo && msg.ChatName != "" {
-		sb.WriteString(fmt.Sprintf("[%s] Chat: %s ", ts, msg.ChatName))
+		sb.WriteString(fmt.Sprintf("[%s] Chat: %s (%s) ", ts, msg.ChatName, msg.ChatJID))
 	} else {
 		sb.WriteString(fmt.Sprintf("[%s] ", ts))
 	}
@@ -2075,6 +2095,39 @@ func (store *MessageStore) FormatMessagesList(messages []MessageInteraction, sho
 		sb.WriteString(store.FormatMessage(m, showChatInfo))
 	}
 	return sb.String()
+}
+
+// resolveChatJID accepts either a chat JID or a chat name. Anything
+// containing "@" is treated as a JID; otherwise it must match exactly one
+// chat name (case-insensitive).
+func (store *MessageStore) resolveChatJID(chat string) (string, error) {
+	if strings.Contains(chat, "@") {
+		return chat, nil
+	}
+	q := "SELECT jid FROM chats WHERE LOWER(name) = LOWER(?) LIMIT 2"
+	if isPostgres {
+		q = "SELECT jid FROM chats WHERE LOWER(name) = LOWER($1) LIMIT 2"
+	}
+	rows, err := store.db.Query(q, chat)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var jids []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err == nil {
+			jids = append(jids, jid)
+		}
+	}
+	switch len(jids) {
+	case 0:
+		return "", fmt.Errorf("no chat named %q; use list_chats to find its JID", chat)
+	case 1:
+		return jids[0], nil
+	default:
+		return "", fmt.Errorf("more than one chat is named %q; use list_chats and pass the JID", chat)
+	}
 }
 
 func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
@@ -2120,8 +2173,12 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	}
 
 	if s.ChatJid != nil && *s.ChatJid != "" {
+		chatJID, err := store.resolveChatJID(*s.ChatJid)
+		if err != nil {
+			return "", err
+		}
 		where = append(where, "m.chat_jid = "+placeholder(len(args)+1))
-		args = append(args, *s.ChatJid)
+		args = append(args, chatJID)
 	}
 
 	if s.Query != nil && *s.Query != "" {
@@ -2412,10 +2469,14 @@ func (store *MessageStore) ListChats(
 	}
 	q += " ORDER BY " + order
 
-	q += " LIMIT " + placeholder(len(args)+1) + "::int"
+	intCast := ""
+	if isPostgres {
+		intCast = "::int"
+	}
+	q += " LIMIT " + placeholder(len(args)+1) + intCast
 	args = append(args, limit)
 
-	q += " OFFSET " + placeholder(len(args)+1) + "::int"
+	q += " OFFSET " + placeholder(len(args)+1) + intCast
 	args = append(args, page*limit)
 
 	rows, err := store.db.Query(q, args...)
@@ -2472,19 +2533,23 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 		return "?"
 	}
 
+	// Prefer the name saved in the address book, then the contact's own
+	// WhatsApp name, then a business name.
+	nameExpr := `COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''), NULLIF(push_name, ''), NULLIF(business_name, ''))`
 	q := `
-        SELECT DISTINCT their_jid, first_name
+        SELECT their_jid, MAX(` + nameExpr + `) AS name
         FROM whatsmeow_contacts
-        WHERE (LOWER(first_name) LIKE LOWER(` + placeholder(1) + `)
+        WHERE (LOWER(` + nameExpr + `) LIKE LOWER(` + placeholder(1) + `)
            OR LOWER(their_jid) LIKE LOWER(` + placeholder(2) + `))
           AND their_jid NOT LIKE '%@g.us'
-        ORDER BY first_name, their_jid
+        GROUP BY their_jid
+        ORDER BY name, their_jid
         LIMIT 50
     `
 
 	args := []any{"%" + query + "%", "%" + query + "%"}
 
-	rows, err := store.db.Query(q, args...)
+	rows, err := store.contactsDB.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
