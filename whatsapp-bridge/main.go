@@ -167,6 +167,23 @@ func validateMediaPath(mediaPath string) (string, error) {
 	return absPath, nil
 }
 
+// safeFilename strips any directory components from a sender-supplied
+// filename so it can't escape the chat's media directory.
+func safeFilename(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/") // treat Windows separators as separators too
+	name = filepath.Base(name)
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." || name == "/" {
+		name = "file_" + time.Now().Format("20060102_150405")
+	}
+	return name
+}
+
 // NewMessageStore Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -638,6 +655,35 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 }
 
 // Function to send a WhatsApp message
+var (
+	sendAllowlistOnce sync.Once
+	sendAllowlist     map[string]bool // nil means no allowlist configured
+)
+
+// recipientAllowed enforces SEND_ALLOWLIST, a comma-separated list of phone
+// numbers (digits only, e.g. 61412345678) and/or full JIDs (e.g.
+// 12036302xxxx@g.us). When unset, every recipient is allowed.
+func recipientAllowed(jid types.JID) bool {
+	sendAllowlistOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("SEND_ALLOWLIST"))
+		if raw == "" {
+			return
+		}
+		sendAllowlist = map[string]bool{}
+		for _, e := range strings.Split(raw, ",") {
+			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "+"))
+			if e != "" {
+				sendAllowlist[e] = true
+			}
+		}
+		slog.Info("SEND_ALLOWLIST enabled", "entries", len(sendAllowlist))
+	})
+	if sendAllowlist == nil {
+		return true
+	}
+	return sendAllowlist[jid.String()] || (jid.Server == types.DefaultUserServer && sendAllowlist[jid.User])
+}
+
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -658,6 +704,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
 		}
+	}
+
+	if !recipientAllowed(recipientJID) {
+		slog.Warn("send blocked: recipient not in SEND_ALLOWLIST", "recipient", recipientJID.String())
+		return false, "Recipient is not in SEND_ALLOWLIST"
 	}
 
 	msg := &waE2E.Message{}
@@ -815,7 +866,7 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 	}
 
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
+		filename := safeFilename(doc.GetFileName())
 		if filename == "" {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
@@ -827,6 +878,21 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 }
 
 // Handle regular incoming messages with media support
+var (
+	webhookClient  = &http.Client{Timeout: 10 * time.Second}
+	webhookURLOnce sync.Once
+	webhookURLVal  string
+)
+
+func getWebhookURL() string {
+	webhookURLOnce.Do(func() {
+		if cfg, err := config.LoadConfig(); err == nil {
+			webhookURLVal = cfg.WebhookUrl
+		}
+	})
+	return webhookURLVal
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
 	sender := normalizeUserJID(client, msg.Info.Sender).User
@@ -873,13 +939,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	if mediaType != "" {
-		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType)
+		slog.Debug("message body", "filename", filename, "content", content)
 	} else if content != "" {
-		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender)
+		slog.Debug("message body", "content", content)
 	}
 	go func(msgID string, chat string) {
-		cfg, err := config.LoadConfig()
-		if err != nil || cfg.WebhookUrl == "" {
+		webhookURL := getWebhookURL()
+		if webhookURL == "" {
 			return
 		}
 
@@ -898,7 +966,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		jsonData, _ := json.Marshal(payload)
 
-		resp, err := http.Post(cfg.WebhookUrl, "application/json", bytes.NewBuffer(jsonData))
+		resp, err := webhookClient.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("Webhook POST error:", err)
 			return
@@ -1057,11 +1125,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	filename = safeFilename(filename)
+	localPath = filepath.Join(chatDir, filename)
 
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	absChatDir, err := filepath.Abs(chatDir)
+	if err != nil || !strings.HasPrefix(absPath, absChatDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("refusing to write media outside %s", chatDir)
 	}
 
 	if _, err := os.Stat(localPath); err == nil {
@@ -1156,7 +1229,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			return
 		}
 
-		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
+		slog.Info("received request to send message", "recipient", req.Recipient, "has_media", req.MediaPath != "")
+		slog.Debug("send request body", "message", req.Message, "media_path", req.MediaPath)
 
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		slog.Info("message sent", "success", success, "message", message)

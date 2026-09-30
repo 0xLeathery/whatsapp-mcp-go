@@ -3,17 +3,45 @@ package helpers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// bearerAuth rejects requests that don't carry "Authorization: Bearer <token>".
+func bearerAuth(token string, next http.Handler) http.Handler {
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), expected) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr reports whether a host:port listen address is loopback-only.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // InitMcpTool initializes MCP tool for the MCP server
 func InitMcpTool() {
@@ -98,12 +126,22 @@ func InitMcpTool() {
 	ctx := context.Background()
 
 	if isHttp {
-		addr := ReadEnv("HTTP_BASE_URL", "0.0.0.0:5777")
-		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr)
+		addr := ReadEnv("HTTP_BASE_URL", "127.0.0.1:5777")
+		token := ReadEnv("MCP_AUTH_TOKEN", "")
+		if token == "" && !isLoopbackAddr(addr) {
+			log.Fatalf("refusing to serve MCP on %s without MCP_AUTH_TOKEN; set a token (openssl rand -base64 48) or bind to 127.0.0.1", addr)
+		}
+		if token != "" && len(token) < 32 {
+			log.Fatalf("MCP_AUTH_TOKEN is too short (need at least 32 characters)")
+		}
+		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr, "auth", token != "")
 
-		handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+		var handler http.Handler = mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 			return server
 		}, nil)
+		if token != "" {
+			handler = bearerAuth(token, handler)
+		}
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}

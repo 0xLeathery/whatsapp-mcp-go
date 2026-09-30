@@ -12,7 +12,7 @@ import (
 var apiBaseURL = readApiBaseURL()
 
 func readApiBaseURL() string {
-	if v := ReadEnv("API_BASE_URL", "http://192.168.178.119:30015/api"); v != "" {
+	if v := ReadEnv("API_BASE_URL", ""); v != "" {
 		return v
 	}
 	const fallback = "http://localhost:8080/api"
