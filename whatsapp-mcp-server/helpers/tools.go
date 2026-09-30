@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -50,6 +51,16 @@ func ErrResult(msg string) *mcp.CallToolResult {
 			&mcp.TextContent{Text: msg},
 		},
 	}
+}
+
+// IsReadOnly reports whether sending is disabled. Read-only is the default;
+// only an explicit READ_ONLY=false (or 0/no) enables the send tools.
+func IsReadOnly() bool {
+	switch strings.ToLower(strings.TrimSpace(ReadEnv("READ_ONLY", "true"))) {
+	case "false", "0", "no":
+		return false
+	}
+	return true
 }
 
 // ReadEnv read return value for an env

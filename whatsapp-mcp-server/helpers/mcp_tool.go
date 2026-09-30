@@ -90,20 +90,26 @@ func InitMcpTool() {
 		Description: "Get most recent WhatsApp message involving the contact.",
 	}, getLastInteractionHandler)
 
-	mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_message",
-		Description: "Send a text message to a person or group on WhatsApp. For groups use the group JID.",
-	}, sendMessageHandler)
+	// READ_ONLY=true (the default) leaves the send tools out entirely, so the
+	// model never sees them. Set READ_ONLY=false to enable sending.
+	if IsReadOnly() {
+		slog.Info("READ_ONLY enabled: send_message, send_file and send_audio_message are not registered")
+	} else {
+		mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_message",
+			Description: "Send a text message to a person or group on WhatsApp. For groups use the group JID.",
+		}, sendMessageHandler)
 
-	mcp.AddTool[sendFileInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_file",
-		Description: "Send image, video, document or any file via WhatsApp.",
-	}, sendFileHandler)
+		mcp.AddTool[sendFileInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_file",
+			Description: "Send image, video, document or any file via WhatsApp.",
+		}, sendFileHandler)
 
-	mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_audio_message",
-		Description: "Send audio/voice message (converted to Opus .ogg if needed).",
-	}, sendAudioMessageHandler)
+		mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_audio_message",
+			Description: "Send audio/voice message (converted to Opus .ogg if needed).",
+		}, sendAudioMessageHandler)
+	}
 
 	mcp.AddTool[downloadMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "download_media",
