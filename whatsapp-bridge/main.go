@@ -655,6 +655,16 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 }
 
 // Function to send a WhatsApp message
+// readOnly reports whether the bridge refuses all sends. Read-only is the
+// default; only an explicit READ_ONLY=false (or 0/no) enables /send.
+func readOnly() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("READ_ONLY"))) {
+	case "false", "0", "no":
+		return false
+	}
+	return true
+}
+
 var (
 	sendAllowlistOnce sync.Once
 	sendAllowlist     map[string]bool // nil means no allowlist configured
@@ -1212,6 +1222,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if readOnly() {
+			slog.Warn("send blocked: READ_ONLY is enabled")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Sending is disabled (READ_ONLY=true)"})
+			return
+		}
 
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1580,7 +1597,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	slog.Info("starting REST API server", "addr", serverAddr)
+	slog.Info("starting REST API server", "addr", serverAddr, "read_only", readOnly())
 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
